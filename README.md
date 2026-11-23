@@ -15,6 +15,7 @@ Generated files are only created when they do not already exist. Existing files 
 The command can generate:
 
 - `flake.nix`: a minimal multi-platform flake development shell
+- `flake.lock`: the input pin shared by all projects (see below)
 - `.envrc`: loads the shell through direnv
 - `justfile`: common Nix/flake commands
 - `.gitignore`: ignores `.direnv/` and `result`
@@ -26,6 +27,33 @@ direnv allow  # optional, if you use direnv
 nix develop
 just --list
 ```
+
+## Shared flake pin
+
+Without a `flake.lock`, every `nix develop` resolves `nixpkgs-unstable` to its
+current revision. Each resolved revision has different store paths, so a new
+project downloads and realizes the whole development shell again, and two
+projects can silently use different nixpkgs versions.
+
+`nixforge init` therefore also generates `flake.lock` from a shared pin. New
+projects reuse the same nixpkgs revision, so their packages are already in the
+local store. The pin lives in `$XDG_DATA_HOME/nixforge/flake.lock` (default
+`~/.local/share/nixforge/flake.lock`); until it exists, the lock embedded in the
+binary is used.
+
+Refresh the shared pin when you want newer packages:
+
+```console
+nixforge update
+```
+
+This updates the pin that future `nixforge init` calls use. It does not touch
+existing projects; update those individually with `just update` (`nix flake
+update`) so their `flake.lock` changes are reviewed like any other commit.
+
+To make new projects reuse the packages already realized by an older project,
+copy that project's `flake.lock` to the pin path once. Omit `nixforge update`
+and every future `nixforge init` keeps using that exact revision.
 
 ## Adding dependencies
 

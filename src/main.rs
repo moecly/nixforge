@@ -1,9 +1,10 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::Path;
-use std::process;
+use std::path::{Path, PathBuf};
+use std::process::{self, Command};
 
 const FLAKE_TEMPLATE: &str = include_str!("templates/flake.nix");
+const FLAKE_LOCK_TEMPLATE: &str = include_str!("../flake.lock");
 const ENVRC_TEMPLATE: &str = include_str!("templates/envrc");
 const JUSTFILE_TEMPLATE: &str = include_str!("templates/justfile");
 const GITIGNORE_TEMPLATE: &str = include_str!("templates/gitignore");
@@ -68,9 +69,10 @@ fn run(args: &[String]) -> Result<(), String> {
         [command] if command == "init" => {
             let current_dir =
                 std::env::current_dir().map_err(|error| format!("failed to get current directory: {error}"))?;
-            init_in_dir(&current_dir)?.print();
+            init_in_dir(&current_dir, &pin_dir()?)?.print();
             Ok(())
         }
+        [command] if command == "update" => update_pin(&pin_dir()?),
         [flag] if flag == "--help" || flag == "-h" => {
             print_help();
             Ok(())
@@ -89,15 +91,30 @@ fn print_help() {
     println!();
     println!("Usage:");
     println!("  nixforge init        Generate missing Nix environment files");
+    println!("  nixforge update      Refresh the shared flake pin used by future inits");
     println!("  nixforge --help      Show this help message");
     println!("  nixforge --version   Show version information");
     println!();
     println!("Files are only generated when they do not already exist.");
+    println!("The shared flake pin lives in $XDG_DATA_HOME/nixforge (default ~/.local/share/nixforge).");
 }
 
-fn init_in_dir(dir: &Path) -> Result<InitReport, String> {
-    let files: [(&'static str, &str); 4] = [
+fn init_in_dir(dir: &Path, pin_dir: &Path) -> Result<InitReport, String> {
+    let shared_lock_path = pin_dir.join("flake.lock");
+    let flake_lock = match fs::read_to_string(&shared_lock_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => FLAKE_LOCK_TEMPLATE.to_string(),
+        Err(error) => {
+            return Err(format!(
+                "failed to read shared flake lock `{}`: {error}",
+                shared_lock_path.display()
+            ));
+        }
+    };
+
+    let files: [(&'static str, &str); 5] = [
         ("flake.nix", FLAKE_TEMPLATE),
+        ("flake.lock", &flake_lock),
         (".envrc", ENVRC_TEMPLATE),
         ("justfile", JUSTFILE_TEMPLATE),
         (".gitignore", GITIGNORE_TEMPLATE),
@@ -131,6 +148,46 @@ fn write_if_missing(path: &Path, contents: &str) -> Result<FileStatus, String> {
     }
 
     Ok(FileStatus::Generated)
+}
+
+fn pin_dir() -> Result<PathBuf, String> {
+    let base = match std::env::var_os("XDG_DATA_HOME") {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => {
+            let home = std::env::var_os("HOME")
+                .filter(|home| !home.is_empty())
+                .ok_or_else(|| "neither XDG_DATA_HOME nor HOME is set".to_string())?;
+            PathBuf::from(home).join(".local/share")
+        }
+    };
+
+    Ok(base.join("nixforge"))
+}
+
+fn update_pin(pin_dir: &Path) -> Result<(), String> {
+    fs::create_dir_all(pin_dir).map_err(|error| format!("failed to create `{}`: {error}", pin_dir.display()))?;
+
+    let flake_path = pin_dir.join("flake.nix");
+    fs::write(&flake_path, FLAKE_TEMPLATE)
+        .map_err(|error| format!("failed to write `{}`: {error}", flake_path.display()))?;
+
+    let lock_path = pin_dir.join("flake.lock");
+    write_if_missing(&lock_path, FLAKE_LOCK_TEMPLATE)
+        .map_err(|error| format!("failed to create `{}`: {error}", lock_path.display()))?;
+
+    let status = Command::new("nix")
+        .args(["flake", "update"])
+        .current_dir(pin_dir)
+        .status()
+        .map_err(|error| format!("failed to run `nix flake update`: {error}"))?;
+
+    if !status.success() {
+        return Err(format!("`nix flake update` failed ({status})"));
+    }
+
+    println!("Updated shared flake pin: {}", lock_path.display());
+    println!("New projects initialized by `nixforge init` will use this lock.");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -169,17 +226,22 @@ mod tests {
         String::from_utf8(fs::read(path).expect("test file should be read")).expect("test file should be UTF-8")
     }
 
+    fn init(temp: &TempDir) -> Result<InitReport, String> {
+        init_in_dir(&temp.path, &temp.path.join("pin"))
+    }
+
     #[test]
     fn init_creates_all_missing_files() {
         let temp = TempDir::new("creates");
 
-        let report = init_in_dir(&temp.path).expect("init should succeed");
+        let report = init(&temp).expect("init should succeed");
 
         assert_eq!(
             report,
             InitReport {
                 statuses: vec![
                     ("flake.nix", FileStatus::Generated),
+                    ("flake.lock", FileStatus::Generated),
                     (".envrc", FileStatus::Generated),
                     ("justfile", FileStatus::Generated),
                     (".gitignore", FileStatus::Generated),
@@ -187,23 +249,39 @@ mod tests {
             }
         );
         assert_eq!(read(&temp.path.join("flake.nix")), FLAKE_TEMPLATE);
+        assert_eq!(read(&temp.path.join("flake.lock")), FLAKE_LOCK_TEMPLATE);
         assert_eq!(read(&temp.path.join(".envrc")), ENVRC_TEMPLATE);
         assert_eq!(read(&temp.path.join("justfile")), JUSTFILE_TEMPLATE);
         assert_eq!(read(&temp.path.join(".gitignore")), GITIGNORE_TEMPLATE);
     }
 
     #[test]
+    fn init_prefers_shared_flake_lock() {
+        let temp = TempDir::new("shared-lock");
+        let pin = temp.path.join("pin");
+        fs::create_dir(&pin).expect("pin directory should be created");
+        write(&pin.join("flake.lock"), "pinned lock");
+
+        let report = init(&temp).expect("init should succeed");
+
+        assert!(report.statuses.contains(&("flake.lock", FileStatus::Generated)));
+        assert_eq!(read(&temp.path.join("flake.lock")), "pinned lock");
+    }
+
+    #[test]
     fn init_skips_existing_files_without_modifying_them() {
         let temp = TempDir::new("skips");
         write(&temp.path.join("flake.nix"), "# existing flake");
+        write(&temp.path.join("flake.lock"), "# existing lock");
         write(&temp.path.join(".envrc"), "# existing envrc");
         write(&temp.path.join("justfile"), "# existing justfile");
         write(&temp.path.join(".gitignore"), "# existing gitignore");
 
-        let report = init_in_dir(&temp.path).expect("init should succeed");
+        let report = init(&temp).expect("init should succeed");
 
         assert!(report.statuses.iter().all(|(_, status)| *status == FileStatus::Skipped));
         assert_eq!(read(&temp.path.join("flake.nix")), "# existing flake");
+        assert_eq!(read(&temp.path.join("flake.lock")), "# existing lock");
         assert_eq!(read(&temp.path.join(".envrc")), "# existing envrc");
         assert_eq!(read(&temp.path.join("justfile")), "# existing justfile");
         assert_eq!(read(&temp.path.join(".gitignore")), "# existing gitignore");
@@ -214,13 +292,14 @@ mod tests {
         let temp = TempDir::new("partial");
         write(&temp.path.join("flake.nix"), "# keep me");
 
-        let report = init_in_dir(&temp.path).expect("init should succeed");
+        let report = init(&temp).expect("init should succeed");
 
         assert_eq!(
             report,
             InitReport {
                 statuses: vec![
                     ("flake.nix", FileStatus::Skipped),
+                    ("flake.lock", FileStatus::Generated),
                     (".envrc", FileStatus::Generated),
                     ("justfile", FileStatus::Generated),
                     (".gitignore", FileStatus::Generated),
@@ -234,15 +313,15 @@ mod tests {
     fn init_is_idempotent() {
         let temp = TempDir::new("idempotent");
 
-        init_in_dir(&temp.path).expect("first init should succeed");
+        init(&temp).expect("first init should succeed");
         let before_flake = read(&temp.path.join("flake.nix"));
-        let before_gitignore = read(&temp.path.join(".gitignore"));
+        let before_lock = read(&temp.path.join("flake.lock"));
 
-        let report = init_in_dir(&temp.path).expect("second init should succeed");
+        let report = init(&temp).expect("second init should succeed");
 
         assert!(report.statuses.iter().all(|(_, status)| *status == FileStatus::Skipped));
         assert_eq!(read(&temp.path.join("flake.nix")), before_flake);
-        assert_eq!(read(&temp.path.join(".gitignore")), before_gitignore);
+        assert_eq!(read(&temp.path.join("flake.lock")), before_lock);
     }
 
     #[test]
