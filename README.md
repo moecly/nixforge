@@ -35,25 +35,36 @@ current revision. Each resolved revision has different store paths, so a new
 project downloads and realizes the whole development shell again, and two
 projects can silently use different nixpkgs versions.
 
-`nixforge init` therefore also generates `flake.lock` from a shared pin. New
-projects reuse the same nixpkgs revision, so their packages are already in the
-local store. The pin lives in `$XDG_DATA_HOME/nixforge/flake.lock` (default
-`~/.local/share/nixforge/flake.lock`); until it exists, the lock embedded in the
-binary is used.
+`nixforge init` therefore also generates `flake.lock` from a shared pin, and
+creates that pin on first use from the lock embedded in the binary. New projects
+reuse the same nixpkgs revision, so their packages are already in the local
+store, and projects do not silently drift to different nixpkgs versions. The pin
+lives in `$XDG_DATA_HOME/nixforge/flake.lock` (default
+`~/.local/share/nixforge/flake.lock`).
 
-Refresh the shared pin when you want newer packages:
+Adopt the lock of an existing project, for example on a new machine:
+
+```console
+nixforge pin path/to/old-project/flake.lock
+nixforge pin path/to/old-project   # same, reads <dir>/flake.lock
+nixforge pin                       # reads ./flake.lock
+```
+
+Pin a specific nixpkgs revision, tag, or branch directly:
+
+```console
+nixforge pin --rev 93a9ed0a866099a230ed5146a5bb7d16fd5c9b14
+```
+
+Refresh the shared pin to the latest nixpkgs:
 
 ```console
 nixforge update
 ```
 
-This updates the pin that future `nixforge init` calls use. It does not touch
-existing projects; update those individually with `just update` (`nix flake
-update`) so their `flake.lock` changes are reviewed like any other commit.
-
-To make new projects reuse the packages already realized by an older project,
-copy that project's `flake.lock` to the pin path once. Omit `nixforge update`
-and every future `nixforge init` keeps using that exact revision.
+Setting or updating the pin only affects future `nixforge init` calls. Existing
+projects keep their own `flake.lock`; update those individually with `just
+update` (`nix flake update`) so the change is reviewed like any other commit.
 
 ## Adding dependencies
 
